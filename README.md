@@ -75,3 +75,7 @@ curl -s -X POST localhost:8000/ask -H 'content-type: application/json' -d '{"que
 - The name is lowercase letters, digits, dashes, or underscores ending in `.pdf`, and cannot replace a corpus file.
 - The content must be valid base64, at most 2 MB, and start with `%PDF-`.
 - At most 20 uploads are held, in memory only.
+
+## Ops plane
+
+Workspaces, tenant isolation, job approval, and audit live under `/v1`. Production apply is refused. See `docs/ARCHITECTURE.md`.
