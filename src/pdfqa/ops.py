@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections import deque
+from functools import wraps
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter(tags=["ops-plane"])
 
 _WORKSPACES: dict[str, dict[str, Any]] = {}
 _JOBS: dict[str, dict[str, Any]] = {}
-_AUDIT: list[dict[str, Any]] = []
+_AUDIT: deque[dict[str, Any]] = deque(maxlen=5000)
 _METRICS = {"jobs_created": 0, "approvals_refused": 0, "approvals_granted": 0}
+
+
+_LOCK = RLock()
+
+
+def _synchronized(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _now() -> str:
@@ -33,11 +47,27 @@ class WorkspaceIn(BaseModel):
     environment: str = "lab"
     owners: list[str] = Field(default_factory=list)
 
+    @field_validator("name", "environment")
+    @classmethod
+    def non_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > 80:
+            raise ValueError("value must contain 1 to 80 non-whitespace characters")
+        return value
+
 
 class JobIn(BaseModel):
     kind: str = Field(min_length=1, max_length=40)
     payload: dict[str, Any] = Field(default_factory=dict)
     target: str = "lab"
+
+    @field_validator("kind", "target")
+    @classmethod
+    def normalize(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > 40:
+            raise ValueError("value must contain 1 to 40 non-whitespace characters")
+        return value.lower()
 
 
 @router.get("/readyz")
@@ -46,6 +76,7 @@ def readyz() -> dict[str, str]:
 
 
 @router.post("/workspaces", status_code=201)
+@_synchronized
 def create_workspace(body: WorkspaceIn, x_tenant_id: str | None = Header(default=None)) -> dict[str, Any]:
     tenant = _tenant(x_tenant_id)
     wid = str(uuid4())
@@ -63,6 +94,7 @@ def create_workspace(body: WorkspaceIn, x_tenant_id: str | None = Header(default
 
 
 @router.get("/workspaces")
+@_synchronized
 def list_workspaces(x_tenant_id: str | None = Header(default=None)) -> dict[str, Any]:
     tenant = _tenant(x_tenant_id)
     items = [w for w in _WORKSPACES.values() if w["tenant"] == tenant]
@@ -70,6 +102,7 @@ def list_workspaces(x_tenant_id: str | None = Header(default=None)) -> dict[str,
 
 
 @router.post("/workspaces/{workspace_id}/jobs", status_code=201)
+@_synchronized
 def create_job(workspace_id: str, body: JobIn, x_tenant_id: str | None = Header(default=None)) -> dict[str, Any]:
     tenant = _tenant(x_tenant_id)
     ws = _WORKSPACES.get(workspace_id)
@@ -93,6 +126,7 @@ def create_job(workspace_id: str, body: JobIn, x_tenant_id: str | None = Header(
 
 
 @router.get("/jobs/{job_id}")
+@_synchronized
 def get_job(job_id: str, x_tenant_id: str | None = Header(default=None)) -> dict[str, Any]:
     tenant = _tenant(x_tenant_id)
     job = _JOBS.get(job_id)
@@ -102,6 +136,7 @@ def get_job(job_id: str, x_tenant_id: str | None = Header(default=None)) -> dict
 
 
 @router.post("/jobs/{job_id}/approve")
+@_synchronized
 def approve_job(job_id: str, x_tenant_id: str | None = Header(default=None)) -> dict[str, Any]:
     tenant = _tenant(x_tenant_id)
     job = _JOBS.get(job_id)
@@ -111,6 +146,8 @@ def approve_job(job_id: str, x_tenant_id: str | None = Header(default=None)) -> 
         _METRICS["approvals_refused"] += 1
         _audit("job.approve.refused", job_id=job_id, reason="prod_apply_disabled")
         raise HTTPException(status_code=403, detail="production apply is disabled in this lab")
+    if job["status"] == "approved":
+        return job
     job["status"] = "approved"
     job["approved_at"] = _now()
     _METRICS["approvals_granted"] += 1
@@ -119,9 +156,9 @@ def approve_job(job_id: str, x_tenant_id: str | None = Header(default=None)) -> 
 
 
 @router.get("/audit")
+@_synchronized
 def audit(x_tenant_id: str | None = Header(default=None), limit: int = 50) -> dict[str, Any]:
     tenant = _tenant(x_tenant_id)
-    items = [e for e in _AUDIT if e.get("tenant") == tenant or "tenant" not in e]
     # include events that reference this tenant's jobs/workspaces
     owned_ws = {w["id"] for w in _WORKSPACES.values() if w["tenant"] == tenant}
     owned_jobs = {j["id"] for j in _JOBS.values() if j["tenant"] == tenant}
@@ -135,5 +172,6 @@ def audit(x_tenant_id: str | None = Header(default=None), limit: int = 50) -> di
 
 
 @router.get("/metrics")
+@_synchronized
 def metrics() -> dict[str, int]:
     return dict(_METRICS)
